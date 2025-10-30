@@ -61,12 +61,23 @@ def get_gspread_client() -> gspread.Client:
 
 class KrakenPairsCache:
     def __init__(self):
-        self._pairs_by_base_quote: Dict[Tuple[str, str], str] = {}
+        # Map canonical (base, quote) -> pair_name (e.g., ("XBT","USD") -> "XXBTZUSD")
+        self._by_bq: Dict[Tuple[str, str], str] = {}
+        # Map altname (e.g., "XBTUSD") -> pair_name
+        self._by_altname: Dict[str, str] = {}
         self._last_refresh = 0.0
+
+    @staticmethod
+    def _strip_prefix(x: str) -> str:
+        # Kraken uses leading X/Z prefixes (e.g., XXBT, ZUSD). Only strip **leading** ones.
+        x = x or ""
+        if x.startswith("X") or x.startswith("Z"):
+            return x[1:]
+        return x
 
     def refresh_if_needed(self):
         now = time.time()
-        if now - self._last_refresh < ASSET_PAIRS_REFRESH_SECS and self._pairs_by_base_quote:
+        if now - self._last_refresh < ASSET_PAIRS_REFRESH_SECS and self._by_bq:
             return
         log.info("Refreshing Kraken AssetPairs mapping...")
         url = f"{KRAKEN_BASE}/AssetPairs"
@@ -76,30 +87,37 @@ class KrakenPairsCache:
         if data.get("error"):
             raise RuntimeError(f"Kraken AssetPairs error: {data['error']}")
         pairs = data["result"]
-        mapping: Dict[Tuple[str, str], str] = {}
+        by_bq: Dict[Tuple[str, str], str] = {}
+        by_alt: Dict[str, str] = {}
         for pair_name, meta in pairs.items():
-            base = meta.get("base", "").replace("X", "").replace("Z", "")  # e.g., XXBT -> XBT
-            quote = meta.get("quote", "").replace("X", "").replace("Z", "")  # e.g., ZUSD -> USD
+            base_raw = meta.get("base", "")  # e.g., "XXBT"
+            quote_raw = meta.get("quote", "")  # e.g., "ZUSD"
+            alt = meta.get("altname")  # e.g., "XBTUSD"
+            base = self._strip_prefix(base_raw)
+            quote = self._strip_prefix(quote_raw)
             if base and quote:
-                mapping[(base, quote)] = pair_name
-        self._pairs_by_base_quote = mapping
+                by_bq[(base, quote)] = pair_name
+            if alt:
+                by_alt[alt] = pair_name
+        self._by_bq = by_bq
+        self._by_altname = by_alt
         self._last_refresh = now
-        log.info("Loaded %d Kraken pairs", len(mapping))
+        log.info("Loaded %d Kraken pairs", len(by_bq))
 
     def find_pair(self, base_input: str, quote: str) -> Optional[str]:
         base_norm = BASE_ALIASES.get(base_input.upper().strip(), base_input.upper().strip())
         quote_norm = quote.upper().strip()
-        # try exact
-        if (base_norm, quote_norm) in self._pairs_by_base_quote:
-            return self._pairs_by_base_quote[(base_norm, quote_norm)]
-        # Some assets are stored in Kraken meta as e.g. XBT while our alias already matches; also try without aliasing
-        for key in [
-            (base_norm, quote_norm),
-            (base_norm.replace("X", ""), quote_norm.replace("Z", "")),
-            (base_input.upper().strip(), quote_norm),
-        ]:
-            if key in self._pairs_by_base_quote:
-                return self._pairs_by_base_quote[key]
+        # Try by altname first (e.g., XBTUSD)
+        alt_try = f"{base_norm}{quote_norm}"
+        if alt_try in self._by_altname:
+            return self._by_altname[alt_try]
+        # Fall back to (base, quote)
+        if (base_norm, quote_norm) in self._by_bq:
+            return self._by_bq[(base_norm, quote_norm)]
+        # Last resort: try base without leading X/Z
+        base_alt = self._strip_prefix(base_norm)
+        if (base_alt, quote_norm) in self._by_bq:
+            return self._by_bq[(base_alt, quote_norm)]
         return None
 
 pairs_cache = KrakenPairsCache()
@@ -113,9 +131,11 @@ def get_kraken_last_price(pair_name: str) -> float:
     if data.get("error"):
         raise RuntimeError(f"Kraken Ticker error: {data['error']}")
     result = data["result"]
-    # result is a dict keyed by the canonical pair name
-    first_key = next(iter(result))
-    last_trade = result[first_key]["c"][0]  # last trade price as string
+    # Prefer the exact pair key we asked for; fall back to the only key present
+    entry = result.get(pair_name)
+    if entry is None:
+        entry = result[next(iter(result))]
+    last_trade = entry["c"][0]  # last trade price as string
     return float(last_trade)
 
 # --------------- Core loop ---------------------------
